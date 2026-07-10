@@ -24,6 +24,9 @@ jest.unstable_mockModule('../src/settle.js', () => ({
   releaseReserved: mockReleaseReserved,
 }));
 
+const mockIngestOutputs = jest.fn();
+jest.unstable_mockModule('../src/ingest.js', () => ({ ingestOutputs: mockIngestOutputs }));
+
 const { handler } = await import('../src/handler.js');
 const { signForTest } = await import('../src/signing.js');
 
@@ -104,4 +107,35 @@ test('already-terminal task settles nothing (idempotency — no double-settle on
   expect(res.statusCode).toBe(200);
   expect(mockDeductReserved).not.toHaveBeenCalled();
   expect(mockReleaseReserved).not.toHaveBeenCalled();
+});
+
+test('success path ingests outputs and merges results/s3_keys/thumbnail_keys into the status patch', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, created_at: '07/10/2026, 10:00:00' }),
+  });
+  mockIngestOutputs.mockResolvedValueOnce({
+    results: [{ s3_key: 'tasks/o1/upscale/2026/07/10/u1/t/1.png', url_type: 'cloudfront', cloudfront_url: 'https://cdn/x' }],
+    s3_keys: ['tasks/o1/upscale/2026/07/10/u1/t/1.png'],
+    thumbnail_keys: ['tasks/o1/upscale/2026/07/10/u1/t/1.webp'],
+  });
+  const res = await handler(baseEvent({
+    event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed',
+    outputs: ['https://x/y.png'], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockIngestOutputs).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'task_1', outputs: ['https://x/y.png'] }));
+});
+
+test('failure path does NOT call ingestOutputs', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7 }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.failed', job_id: 'job_1', tool: 'upscale', status: 'failed',
+    outputs: [], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockIngestOutputs).not.toHaveBeenCalled();
 });

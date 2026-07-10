@@ -1,6 +1,7 @@
 import { verifyWebhook } from './signing.js';
 import { firestore } from './firebase.js';
 import { writeTerminalStatus, TERMINAL, deductReserved, releaseReserved } from './settle.js';
+import { ingestOutputs } from './ingest.js';
 
 const SECRET = () => process.env.WEBHOOK_SIGNING_SECRET;
 const OK = (body = '{}') => ({ statusCode: 200, body });
@@ -37,10 +38,23 @@ export async function handler(event) {
   const userId = taskData.user_id;
   const amount = Math.max(0, Math.trunc(Number(taskData.credits) || 0));
 
+  // Phase 3: ingest outputs BEFORE writeTerminalStatus so a crash during ingest
+  // leaves the task non-terminal (→ webhook retries). S3 PutObject is idempotent,
+  // so a retry re-uploads safely. On failure (job.failed), skip ingest entirely.
+  let ingest = null;
+  if (ok && Array.isArray(payload.outputs) && payload.outputs.length) {
+    try {
+      ingest = await ingestOutputs({ taskId, taskData, outputs: payload.outputs });
+    } catch (e) {
+      console.error('[bridge] ingest failed (transient):', taskId, e);
+      return FAIL(500, '{"error":"ingest_failed"}'); // retry — outputs not yet copied
+    }
+  }
+
   try {
-    await writeTerminalStatus({ taskId, payload, taskData });
+    await writeTerminalStatus({ taskId, payload, taskData, ingest });
   } catch (e) {
-    console.error('[bridge] write failed (transient):', e);
+    console.error('[bridge] write failed (transient):', taskId, e);
     return FAIL(500, '{"error":"write_failed"}'); // retry
   }
 

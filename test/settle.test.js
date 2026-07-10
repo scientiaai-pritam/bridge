@@ -10,6 +10,7 @@ const taskState = {};
 const mockOrgGet = jest.fn();
 const mockUserGet = jest.fn();
 const mockTaskGet = jest.fn();
+const mockTaskUpdate = jest.fn();
 
 // Tag each doc ref with its path so the txn.update mock can route writes to the
 // right shadow object.
@@ -22,6 +23,7 @@ jest.unstable_mockModule('../src/firebase.js', () => {
       if (path.startsWith('tasks/')) return { exists: true, data: () => mockTaskGet() };
       return { exists: false, data: () => null };
     },
+    update: mockTaskUpdate,
   });
   return {
     firestore: () => ({
@@ -39,7 +41,7 @@ jest.unstable_mockModule('../src/firebase.js', () => {
   };
 });
 
-const { deductReserved, releaseReserved } = await import('../src/settle.js');
+const { deductReserved, releaseReserved, writeTerminalStatus } = await import('../src/settle.js');
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -94,5 +96,65 @@ describe('releaseReserved', () => {
     mockTaskGet.mockReturnValue({ credits_settled: true });
     await releaseReserved({ taskId: 't1', orgId: 'o1', amount: 7 });
     expect(Object.keys(orgState)).toHaveLength(0);
+  });
+});
+
+describe('writeTerminalStatus', () => {
+  test('with ingest merges results/s3_keys/thumbnail_keys + durations on success', async () => {
+    const ingest = {
+      results: [{ s3_key: 'tasks/o1/upscale/2026/07/10/u1/t/1.png', url_type: 'cloudfront', cloudfront_url: 'https://cdn/x' }],
+      s3_keys: ['tasks/o1/upscale/2026/07/10/u1/t/1.png'],
+      thumbnail_keys: ['tasks/o1/upscale/2026/07/10/u1/t/1.webp'],
+    };
+    await writeTerminalStatus({
+      taskId: 'task_1',
+      payload: { event: 'job.completed', job_id: 'job_1' },
+      taskData: { user_id: 'u1', created_at: '07/10/2026, 10:00:00', processing_started_at: '07/10/2026, 10:01:00' },
+      ingest,
+    });
+    expect(mockTaskUpdate).toHaveBeenCalledTimes(1);
+    const patch = mockTaskUpdate.mock.calls[0][0];
+    expect(patch.status).toBe('completed');
+    expect(patch.results).toEqual(ingest.results);
+    expect(patch.s3_keys).toEqual(ingest.s3_keys);
+    expect(patch.thumbnail_keys).toEqual(ingest.thumbnail_keys);
+    expect(patch.completed_at).toBeTruthy();
+    expect(patch.queue_duration_ms).toBeGreaterThanOrEqual(0);
+    expect(patch.processing_duration_ms).toBeGreaterThanOrEqual(0);
+    expect(patch.total_duration_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  test('without ingest omits results/s3_keys/thumbnail_keys on success', async () => {
+    await writeTerminalStatus({
+      taskId: 'task_2',
+      payload: { event: 'job.completed', job_id: 'job_2' },
+      taskData: { user_id: 'u1' },
+    });
+    expect(mockTaskUpdate).toHaveBeenCalledTimes(1);
+    const patch = mockTaskUpdate.mock.calls[0][0];
+    expect(patch.status).toBe('completed');
+    expect(patch.completed_at).toBeTruthy();
+    expect(patch).not.toHaveProperty('results');
+    expect(patch).not.toHaveProperty('s3_keys');
+    expect(patch).not.toHaveProperty('thumbnail_keys');
+  });
+
+  test('failure branch unchanged: no ingest fields, no durations', async () => {
+    await writeTerminalStatus({
+      taskId: 'task_3',
+      payload: { event: 'job.failed', job_id: 'job_3' },
+      taskData: { user_id: 'u1' },
+      ingest: { results: [], s3_keys: [], thumbnail_keys: [] }, // must be ignored on failure
+    });
+    expect(mockTaskUpdate).toHaveBeenCalledTimes(1);
+    const patch = mockTaskUpdate.mock.calls[0][0];
+    expect(patch.status).toBe('failed');
+    expect(patch.failed_at).toBeTruthy();
+    expect(patch.error_message).toMatch(/failed/);
+    expect(patch).not.toHaveProperty('results');
+    expect(patch).not.toHaveProperty('s3_keys');
+    expect(patch).not.toHaveProperty('thumbnail_keys');
+    expect(patch).not.toHaveProperty('completed_at');
+    expect(patch).not.toHaveProperty('queue_duration_ms');
   });
 });

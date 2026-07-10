@@ -7,18 +7,37 @@ const nowStr = () => new Date().toLocaleString('en-US', { timeZone: KOLKATA });
 /**
  * Phase 1 terminal-status writer. Writes Firestore tasks/{taskId} + RTDB tasks/{userId}.
  * Phase 2 adds credit settle; Phase 3 adds s3_keys ingest. Returns the task data read.
+ *
+ * Phase 3: on success, merges `ingest` ({results, s3_keys, thumbnail_keys}) plus
+ * `completed_at` and best-effort duration fields into the Firestore patch. The
+ * `ingest` argument is null/absent on failure and on Phase-2 callers that don't
+ * pass it — the success branch then omits the output arrays (backward compatible).
  */
-export async function writeTerminalStatus({ taskId, payload, taskData }) {
+export async function writeTerminalStatus({ taskId, payload, taskData, ingest = null }) {
   const userId = taskData.user_id;
   const ok = payload.event === 'job.completed';
 
+  const completedAt = nowStr();
   const firestorePatch = {
     status: ok ? 'completed' : 'failed',
     api_job_id: payload.job_id,
-    updated_at: nowStr(),
-    ...(ok ? { completed_at: nowStr() } : { failed_at: nowStr() }),
-    ...(ok ? {} : { error_message: `API-tier job ${payload.job_id} failed` }),
+    updated_at: completedAt,
+    ...(ok
+      ? {
+          completed_at: completedAt,
+          ...(ingest ? { results: ingest.results, s3_keys: ingest.s3_keys, thumbnail_keys: ingest.thumbnail_keys } : {}),
+        }
+      : {
+          failed_at: completedAt,
+          error_message: `API-tier job ${payload.job_id} failed`,
+        }),
   };
+
+  // Duration fields (best-effort; null when timestamps missing — matches legacy _ms).
+  if (ok) {
+    const durations = computeDurationsMs(taskData, completedAt);
+    Object.assign(firestorePatch, durations);
+  }
 
   await firestore().doc(`tasks/${taskId}`).update(firestorePatch);
 
@@ -32,6 +51,25 @@ export async function writeTerminalStatus({ taskId, payload, taskData }) {
     }
   }
   return firestorePatch;
+}
+
+// Returns { queue_duration_ms, processing_duration_ms, total_duration_ms }, each number|null.
+export function computeDurationsMs(taskData, completedAtStr) {
+  const created = parseKolkataMs(taskData.created_at);
+  const started = parseKolkataMs(taskData.processing_started_at);
+  const done = parseKolkataMs(completedAtStr);
+  const out = {};
+  out.total_duration_ms = created != null && done != null ? Math.max(0, done - created) : null;
+  out.queue_duration_ms = created != null && started != null ? Math.max(0, started - created) : null;
+  out.processing_duration_ms = started != null && done != null ? Math.max(0, done - started) : null;
+  return out;
+}
+
+// task.created_at is "MM/DD/YYYY, HH:MM:SS" (en-US Kolkata) from buildBaseTask.
+export function parseKolkataMs(s) {
+  if (!s) return null;
+  const t = Date.parse(`${s.replace(',', '')} GMT+0530`);
+  return Number.isFinite(t) ? t : null;
 }
 
 export const TERMINAL = new Set(['completed', 'failed']);

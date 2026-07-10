@@ -1,6 +1,6 @@
 import { verifyWebhook } from './signing.js';
 import { firestore } from './firebase.js';
-import { writeTerminalStatus, TERMINAL } from './settle.js';
+import { writeTerminalStatus, TERMINAL, deductReserved, releaseReserved } from './settle.js';
 
 const SECRET = () => process.env.WEBHOOK_SIGNING_SECRET;
 const OK = (body = '{}') => ({ statusCode: 200, body });
@@ -32,11 +32,36 @@ export async function handler(event) {
   const taskData = snap.data() || {};
   if (TERMINAL.has(taskData.status)) return OK('{"ok":"already_terminal"}'); // idempotency
 
+  const ok = payload.event === 'job.completed';
+  const orgId = taskData.org_id;
+  const userId = taskData.user_id;
+  const amount = Math.max(0, Math.trunc(Number(taskData.credits) || 0));
+
   try {
     await writeTerminalStatus({ taskId, payload, taskData });
   } catch (e) {
     console.error('[bridge] write failed (transient):', e);
     return FAIL(500, '{"error":"write_failed"}'); // retry
+  }
+
+  // Settle AFTER writeTerminalStatus. Layer-1 idempotency: the terminal-status
+  // gate above (TERMINAL.has(taskData.status) → 200 + exit) prevents a retried
+  // webhook from reaching here. Layer-2 idempotency: deductReserved/releaseReserved
+  // each no-op when tasks/{taskId}.credits_settled === true, so the reconcile
+  // safety net (Task 6) can re-run them without double-deduct.
+  if (orgId && amount > 0) {
+    try {
+      if (ok) {
+        await deductReserved({ taskId, orgId, uid: userId, amount });
+      } else {
+        await releaseReserved({ taskId, orgId, amount });
+      }
+    } catch (e) {
+      // Status is already terminal in Firestore; a bridge retry would hit the
+      // terminal gate and settle nothing, so returning non-2xx won't help. Log,
+      // accept, and let reconcile (Task 6) heal the leaked reservation.
+      console.error('[bridge] credit settle failed (status already terminal; reconcile will heal):', e);
+    }
   }
   return OK();
 }

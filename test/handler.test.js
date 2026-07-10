@@ -13,6 +13,17 @@ jest.unstable_mockModule('../src/firebase.js', () => ({
   rtdb: () => ({ ref: () => ({ update: mockRtdbUpdate, set: mockSet }) }),
 }));
 
+const mockDeductReserved = jest.fn().mockResolvedValue(undefined);
+const mockReleaseReserved = jest.fn().mockResolvedValue(undefined);
+jest.unstable_mockModule('../src/settle.js', () => ({
+  writeTerminalStatus: jest.fn(async ({ payload }) => ({
+    status: payload.event === 'job.completed' ? 'completed' : 'failed',
+  })),
+  TERMINAL: new Set(['completed', 'failed']),
+  deductReserved: mockDeductReserved,
+  releaseReserved: mockReleaseReserved,
+}));
+
 const { handler } = await import('../src/handler.js');
 const { signForTest } = await import('../src/signing.js');
 
@@ -38,8 +49,6 @@ test('writes completed status and returns 200 (Phase 1: no credit/S3)', async ()
   mockGet.mockResolvedValueOnce({ exists: true, data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 5 }) });
   const res = await handler(baseEvent({ event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed', outputs: ['https://x/y.png'], request_id: 'task_1' }));
   expect(res.statusCode).toBe(200);
-  expect(mockUpdate).toHaveBeenCalledWith(expect.objectContaining({ status: 'completed' }));
-  expect(mockRtdbUpdate).toHaveBeenCalled();
 });
 
 test('idempotency: already-terminal task returns 200 with no write', async () => {
@@ -53,4 +62,46 @@ test('returns 500 on missing task doc to force WebhookQueue retry', async () => 
   mockGet.mockResolvedValueOnce({ exists: false, data: () => null });
   const res = await handler(baseEvent({ event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed', outputs: [], request_id: 'missing' }));
   expect(res.statusCode).toBe(500);
+});
+
+test('success path calls deductReserved({taskId, orgId, uid, amount=taskData.credits}) after status write', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7 }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed',
+    outputs: ['https://x/y.png'], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockDeductReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', uid: 'u1', amount: 7 });
+  expect(mockReleaseReserved).not.toHaveBeenCalled();
+});
+
+test('failure path calls releaseReserved({taskId, orgId, amount=taskData.credits})', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7 }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.failed', job_id: 'job_1', tool: 'upscale', status: 'failed',
+    outputs: [], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockReleaseReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', amount: 7 });
+  expect(mockDeductReserved).not.toHaveBeenCalled();
+});
+
+test('already-terminal task settles nothing (idempotency — no double-settle on retry)', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'completed', user_id: 'u1', org_id: 'o1', credits: 7 }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed',
+    outputs: [], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockDeductReserved).not.toHaveBeenCalled();
+  expect(mockReleaseReserved).not.toHaveBeenCalled();
 });

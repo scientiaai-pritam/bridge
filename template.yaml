@@ -1,0 +1,55 @@
+# =============================================================================
+# tdai-bridge SAM template (Phase 1)
+#
+# One Node 20 Lambda exposing an HTTP Function URL (AuthType: NONE). Auth is
+# performed in-handler via HMAC signature verification (see src/signing.js),
+# mirroring the API tier's `WebhookFn` outbound signing. No IAM beyond SAM
+# defaults; no S3 (Phase 3); no extra functions.
+#
+# Deploy + end-to-end runbook: see bridge/RUNBOOK.md
+# =============================================================================
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+  # Same value the API tier's WebhookFn signs with (SSM WEBHOOK_SIGNING_SECRET).
+  WebhookSecret:
+    Type: String
+    NoEcho: true
+  FirebaseProjectId:
+    Type: String
+  FirebaseClientEmail:
+    Type: String
+  FirebasePrivateKey:
+    Type: String
+    NoEcho: true
+  FirebaseDatabaseUrl:
+    Type: String
+
+Resources:
+  BridgeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "tdai-bridge-${Stage}"
+      Runtime: nodejs20.x
+      Handler: src/handler.handler
+      CodeUri: .
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          WEBHOOK_SIGNING_SECRET: !Ref WebhookSecret
+          FIREBASE_PROJECT_ID: !Ref FirebaseProjectId
+          FIREBASE_CLIENT_EMAIL: !Ref FirebaseClientEmail
+          FIREBASE_PRIVATE_KEY: !Ref FirebasePrivateKey
+          FIREBASE_DATABASE_URL: !Ref FirebaseDatabaseUrl
+      FunctionUrlConfig:
+        AuthType: NONE            # auth = HMAC signature verification (src/signing.js)
+        InvokeMode: BUFFERED
+
+Outputs:
+  BridgeUrl:
+    Value: !GetAtt BridgeFunctionUrl.FunctionUrl
+    Description: Public Function URL — set this as the web's BRIDGE_WEBHOOK_URL.

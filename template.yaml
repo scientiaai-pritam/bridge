@@ -27,6 +27,19 @@ Parameters:
     NoEcho: true
   FirebaseDatabaseUrl:
     Type: String
+  # Web storage bucket (the web's STORAGE_BUCKET_NAME). Bridge uploads ingested
+  # outputs here under the legacy key pattern. Scoped by the S3 IAM policy below.
+  WebS3Bucket:
+    Type: String
+  # Optional CloudFront domain serving the web bucket. When USE_CLOUDFRONT=true
+  # and this is set, results carry cloudfront_url instead of a presigned URL.
+  CloudfrontDomain:
+    Type: String
+    Default: ""
+  # "true" enables CloudFront URL build (requires CloudfrontDomain). Default off.
+  UseCloudfront:
+    Type: String
+    Default: "false"
 
 Resources:
   BridgeFunction:
@@ -37,7 +50,12 @@ Resources:
       Handler: src/handler.handler
       CodeUri: .
       MemorySize: 512
-      Timeout: 30
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject]
+              Resource: !Sub "arn:aws:s3:::${WebS3Bucket}/*"
       Environment:
         Variables:
           WEBHOOK_SIGNING_SECRET: !Ref WebhookSecret
@@ -45,6 +63,10 @@ Resources:
           FIREBASE_CLIENT_EMAIL: !Ref FirebaseClientEmail
           FIREBASE_PRIVATE_KEY: !Ref FirebasePrivateKey
           FIREBASE_DATABASE_URL: !Ref FirebaseDatabaseUrl
+          AWS_S3_BUCKET: !Ref WebS3Bucket
+          AWS_REGION: !Ref AWS::Region
+          CLOUDFRONT_DOMAIN: !Ref CloudfrontDomain
+          USE_CLOUDFRONT: !Ref UseCloudfront
       FunctionUrlConfig:
         AuthType: NONE            # auth = HMAC signature verification (src/signing.js)
         InvokeMode: BUFFERED

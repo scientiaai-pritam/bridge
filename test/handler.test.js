@@ -1,3 +1,6 @@
+// Self-sufficient: the suite must pass whether or not the runner exports this env var.
+process.env.WEBHOOK_SIGNING_SECRET = process.env.WEBHOOK_SIGNING_SECRET || 'whsec_test';
+
 import { jest } from '@jest/globals';
 
 const mockGet = jest.fn();

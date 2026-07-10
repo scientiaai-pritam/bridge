@@ -23,7 +23,7 @@ export async function handler(event) {
   try {
     snap = await firestore().doc(`tasks/${taskId}`).get();
   } catch (e) {
-    console.error('[bridge] firestore read failed (transient):', e);
+    console.error('[bridge] firestore read failed (transient):', taskId, e);
     return FAIL(500, '{"error":"firestore_read"}'); // retry
   }
 

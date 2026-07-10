@@ -5,6 +5,9 @@ const TOLERANCE_SECONDS = 300;
 /** Constant-time HMAC verify mirroring designer-ai-api-tier src/common/signing.py verify_outbound. */
 export function verifyWebhook(rawBody, signatureHeader, secret, nowMs) {
   if (!signatureHeader || typeof signatureHeader !== 'string') return false;
+  // Guard against a misconfigured bridge (missing secret): reject cleanly with
+  // 401 in the handler instead of crashing in createHmac.
+  if (!secret || typeof secret !== 'string') return false;
   let ts, sig;
   try {
     const parts = Object.fromEntries(

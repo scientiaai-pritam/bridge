@@ -1,4 +1,4 @@
-# tdai-bridge — Phase 1 deploy + end-to-end runbook
+# tdai-bridge — deploy + end-to-end runbook (Phase 1 + Phase 3)
 
 > Operator-only. These steps require AWS credentials, a deployed API tier,
 > Firebase Admin credentials, and the dev web app. They are NOT executed in
@@ -32,7 +32,10 @@ sam deploy --guided \
       FirebaseProjectId=<firebase-project-id> \
       FirebaseClientEmail=<svc-account-email> \
       FirebasePrivateKey="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n" \
-      FirebaseDatabaseUrl=https://<project>.firebaseio.com
+      FirebaseDatabaseUrl=https://<project>.firebaseio.com \
+      WebS3Bucket=<web STORAGE_BUCKET_NAME, e.g. textile-designer-ai-development> \
+      CloudfrontDomain=<your CloudFront domain, or leave blank> \
+      UseCloudfront=<true|false>
 ```
 
 Expected: stack `tdai-bridge-dev` reaches `CREATE_COMPLETE`, the `BridgeUrl`
@@ -65,11 +68,29 @@ Then:
 3. **Wait for finalize.** The API tier runs the job and `WebhookFn` POSTs the
    bridge Function URL with the signed payload.
 
-4. **Success path.** Confirm CloudWatch logs on `tdai-bridge-dev` show a 200,
-   and `tasks/{taskId}` transitions to `completed`.
-   (Phase 1: `s3_keys` / `results` are NOT yet populated — that arrives in
-   Phase 3 with `bridge/src/ingest.js`. The UI's `listenToTask` should fire
-   `onCompleted`.)
+4. **Success path + output ingest (Phase 3).** Confirm CloudWatch logs on
+   `tdai-bridge-dev` show a 200, and `tasks/{taskId}` transitions to
+   `completed` WITH:
+   - `results` = `[{ s3_key, cloudfront_url|presigned_url, url_type }]`
+   - `s3_keys` = bare keys (same length as outputs)
+   - `thumbnail_keys` = the `.webp` keys (same length)
+   - `completed_at`, `total_duration_ms` (+ `queue_duration_ms` /
+     `processing_duration_ms` if `processing_started_at` is on the doc).
+   Then confirm the object actually exists in the web bucket:
+   ```bash
+   aws s3api head-object --bucket <WebS3Bucket> \
+     --key tasks/<org_id>/upscale/<yyyy>/<mm>/<dd>/<user_id>/<taskId>/1.png
+   ```
+   And confirm the result image renders in the UI (resolved from `s3_key`
+   via `/api/s3/get-presigned-url`). The UI's `listenToTask` fires `onCompleted`.
+
+   **Thumbnail verification:** a separate event-listener Lambda generates the
+   actual `.webp` thumbnails from the uploaded PNG (same as for legacy tasks).
+   After the task completes, confirm the `.webp` object appears in the web
+   bucket at the `thumbnail_keys` path (or that the library/favorites grid
+   renders the thumbnail). If `.webp` objects do NOT appear, the thumbnail
+   listener is not firing for these paths — file a follow-up (the bridge does
+   not generate thumbnails itself).
 
 5. **Failure path.** Submit an intentionally bad input that the provider
    rejects. Confirm `tasks/{taskId}` → `failed` with `error_message`, RTDB
@@ -80,9 +101,8 @@ Then:
    Confirm the bridge returns 200 with `{"ok":"already_terminal"}` and there
    is no double-write on `tasks/{taskId}` or RTDB.
 
-## Step 4 — Commit (done locally; git policy is no-commit in the sandbox)
+## Step 4 — Commits (done)
 
-```bash
-git add bridge/template.yaml bridge/.env.example bridge/RUNBOOK.md
-git commit -m "feat(bridge): SAM template + deploy + Phase-1 round-trip runbook"
-```
+The template, env example, and this runbook are committed on
+`feat/api-tier-web-integration` (Phase 1 + Phase 3). Operator action: none —
+this section documents what landed.

@@ -5,6 +5,6 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": { "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js" },
-  "dependencies": { "firebase-admin": "^12.6.0" },
+  "dependencies": { "@aws-sdk/client-s3": "^3.654.0", "@aws-sdk/s3-request-presigner": "^3.654.0", "firebase-admin": "^12.6.0" },
   "devDependencies": { "jest": "^29.7.0" }
 }

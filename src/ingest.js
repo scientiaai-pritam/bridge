@@ -44,8 +44,11 @@ export async function ingestOutputs({ taskId, taskData, outputs }) {
 
   outputs.forEach((_u, i) => { /* presence check below */ });
   let idx = 0;
-  for (const url of outputs || []) {
+  for (const entry of outputs || []) {
     idx += 1;
+    // API tier sends {type, url, expires_in} objects; accept both shapes.
+    const url = typeof entry === 'string' ? entry : entry?.url;
+    if (!url) throw new Error(`no url on output ${idx}`);
     const resp = await fetch(url);
     if (!resp.ok) {
       throw new Error(`download failed for output ${idx}: HTTP ${resp.status}`);

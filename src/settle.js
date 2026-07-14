@@ -40,17 +40,46 @@ export async function writeTerminalStatus({ taskId, payload, taskData, ingest = 
   }
 
   await firestore().doc(`tasks/${taskId}`).update(firestorePatch);
+  console.log(`[bridge] WROTE firestore tasks/${taskId} status=${firestorePatch.status} keys=${Object.keys(firestorePatch).join(',')}`);
 
   if (userId) {
-    const rtdbPatch = { status: firestorePatch.status, updated_at: nowStr() };
-    if (ok) rtdbPatch.completed_at = nowStr(); else rtdbPatch.failed_at = nowStr();
+    // Mirror the FULL Firestore task doc to RTDB (not just the status patch).
+    // The UI's RTDB listener (getCurrentTasks) emits RTDB-only data whenever
+    // firestore_id is unchanged on an RTDB update — so an RTDB node lacking
+    // `results`/`s3_keys` leaves the spinner stuck with no output even though
+    // Firestore is complete. Re-read the doc and mirror it verbatim so RTDB is
+    // a true copy of the tasks DB entry the UI picks up.
     try {
-      await rtdb().ref(`tasks/${userId}`).update(rtdbPatch);
+      const fresh = await firestore().doc(`tasks/${taskId}`).get();
+      if (fresh.exists) {
+        const mirror = toRtdbSafe(fresh.data());
+        await rtdb().ref(`tasks/${userId}`).set(mirror);
+        console.log(`[bridge] WROTE rtdb tasks/${userId} status=${mirror.status} keys=${Object.keys(mirror).length}`);
+      }
     } catch (e) {
       console.error('[bridge] RTDB mirror failed (non-fatal):', e);
     }
   }
   return firestorePatch;
+}
+
+// Convert a Firestore doc into an RTDB-safe plain object. Firestore Timestamp
+// values (and GeoPoint/etc.) are not legal RTDB leaves, so recurse and render
+// any Timestamp to epoch millis (matches RTDB ServerValue.TIMESTAMP convention).
+export function toRtdbSafe(value) {
+  if (value === null || value === undefined) return value;
+  if (Array.isArray(value)) return value.map(toRtdbSafe);
+  if (typeof value === 'object') {
+    // Firestore Admin SDK Timestamp exposes toDate()/toMillis().
+    if (typeof value.toMillis === 'function') return value.toMillis();
+    if (typeof value.toDate === 'function') {
+      try { return value.toDate().getTime(); } catch { /* fall through */ }
+    }
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = toRtdbSafe(v);
+    return out;
+  }
+  return value;
 }
 
 // Returns { queue_duration_ms, processing_duration_ms, total_duration_ms }, each number|null.

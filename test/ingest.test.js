@@ -17,18 +17,22 @@ const { ingestOutputs } = await import('../src/ingest.js');
 
 beforeEach(() => jest.clearAllMocks());
 
-test('downloads each output, uploads to the legacy key pattern, returns results/s3_keys/thumbnail_keys', async () => {
+test('downloads each output, uploads under the tool-and-input-wise key, returns results/s3_keys/thumbnail_keys', async () => {
   mockFetch.mockResolvedValue({ ok: true, headers: { get: () => 'image/png' }, arrayBuffer: () => new ArrayBuffer(4) });
   const out = await ingestOutputs({
     taskId: 'task_1',
-    taskData: { org_id: 'o1', user_id: 'u1', type: 'upscale' },
+    taskData: {
+      org_id: 'o1', user_id: 'u1', type: 'upscale',
+      ref_image: 'https://s3/inputs/mydesign.png',
+      extra_params: { scale_factor: 4, creativity: 35 },
+    },
     outputs: ['https://api/outputs/job_1.png?sig=1'],
   });
   expect(mockUploadBytes).toHaveBeenCalledTimes(1);
   const [bucket, key, _body, ct] = mockUploadBytes.mock.calls[0];
   expect(bucket).toBe('web-bucket');
   expect(ct).toBe('image/png');
-  expect(key).toMatch(/^tasks\/o1\/upscale\/\d{4}\/\d{2}\/\d{2}\/u1\/task_1\/1\.png$/);
+  expect(key).toMatch(/^tasks\/o1\/upscale\/\d{4}\/\d{2}\/\d{2}\/u1\/task_1\/mydesign_rtp_4_35\.png$/);
   expect(out.s3_keys).toEqual([key]);
   expect(out.thumbnail_keys).toEqual([key.replace(/\.png$/, '.webp')]);
   expect(out.results[0]).toMatchObject({ s3_key: key, url_type: 'cloudfront' });
@@ -38,10 +42,10 @@ test('downloads each output, uploads to the legacy key pattern, returns results/
 test('derives ext from content-type when URL has none', async () => {
   mockFetch.mockResolvedValue({ ok: true, headers: { get: () => 'image/webp' }, arrayBuffer: () => new ArrayBuffer(4) });
   const out = await ingestOutputs({
-    taskId: 'task_2', taskData: { org_id: 'o1', user_id: 'u1', type: 'upscale' },
+    taskId: 'task_2', taskData: { org_id: 'o1', user_id: 'u1', type: 'bg_remove', ref_image: 'https://s3/in/x.png' },
     outputs: ['https://api/outputs/noext'], // no extension
   });
-  expect(out.s3_keys[0]).toMatch(/\.webp$/);
+  expect(out.s3_keys[0]).toMatch(/x_bg_removed\.webp$/);
 });
 
 test('throws on a failed download (non-2xx) so the bridge returns non-2xx → retry', async () => {
@@ -55,9 +59,9 @@ test('throws on a failed download (non-2xx) so the bridge returns non-2xx → re
 test('indexes outputs 1..n in filename order', async () => {
   mockFetch.mockResolvedValue({ ok: true, headers: { get: () => 'image/png' }, arrayBuffer: () => new ArrayBuffer(4) });
   const out = await ingestOutputs({
-    taskId: 'task_4', taskData: { org_id: 'o1', user_id: 'u1', type: 'upscale' },
+    taskId: 'task_4', taskData: { org_id: 'o1', user_id: 'u1', type: 'object_layering', ref_image: 'https://s3/in/d.png' },
     outputs: ['https://a', 'https://b'],
   });
-  expect(out.s3_keys[0]).toMatch(/\/1\.png$/);
-  expect(out.s3_keys[1]).toMatch(/\/2\.png$/);
+  expect(out.s3_keys[0]).toMatch(/d_layered_1\.png$/);
+  expect(out.s3_keys[1]).toMatch(/d_layered_2\.png$/);
 });

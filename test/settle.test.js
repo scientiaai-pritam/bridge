@@ -11,6 +11,8 @@ const mockOrgGet = jest.fn();
 const mockUserGet = jest.fn();
 const mockTaskGet = jest.fn();
 const mockTaskUpdate = jest.fn();
+const mockRtdbSet = jest.fn();
+const mockRtdbUpdate = jest.fn();
 
 // Tag each doc ref with its path so the txn.update mock can route writes to the
 // right shadow object.
@@ -37,7 +39,7 @@ jest.unstable_mockModule('../src/firebase.js', () => {
         },
       })),
     }),
-    rtdb: () => ({ ref: () => ({ update: jest.fn(), set: jest.fn() }) }),
+    rtdb: () => ({ ref: () => ({ update: mockRtdbUpdate, set: mockRtdbSet }) }),
   };
 });
 
@@ -156,5 +158,16 @@ describe('writeTerminalStatus', () => {
     expect(patch).not.toHaveProperty('thumbnail_keys');
     expect(patch).not.toHaveProperty('completed_at');
     expect(patch).not.toHaveProperty('queue_duration_ms');
+  });
+
+  test('does NOT mirror to RTDB tasks/{userId} (Firestore is the sole terminal write)', async () => {
+    await writeTerminalStatus({
+      taskId: 'task_4',
+      payload: { event: 'job.completed', job_id: 'job_4' },
+      taskData: { user_id: 'u1' },
+    });
+    expect(mockRtdbSet).not.toHaveBeenCalled();
+    expect(mockRtdbUpdate).not.toHaveBeenCalled();
+    expect(mockTaskUpdate).toHaveBeenCalledTimes(1);
   });
 });

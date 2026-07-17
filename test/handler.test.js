@@ -49,7 +49,7 @@ test('returns 401 on bad signature', async () => {
 });
 
 test('writes completed status and returns 200 (Phase 1: no credit/S3)', async () => {
-  mockGet.mockResolvedValueOnce({ exists: true, data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 5 }) });
+  mockGet.mockResolvedValueOnce({ exists: true, data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 5, api_job_id: 'job_1' }) });
   const res = await handler(baseEvent({ event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed', outputs: ['https://x/y.png'], request_id: 'task_1' }));
   expect(res.statusCode).toBe(200);
 });
@@ -70,7 +70,7 @@ test('returns 500 on missing task doc to force WebhookQueue retry', async () => 
 test('success path calls deductReserved({taskId, orgId, uid, amount=taskData.credits}) after status write', async () => {
   mockGet.mockResolvedValueOnce({
     exists: true,
-    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7 }),
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, api_job_id: 'job_1' }),
   });
   const res = await handler(baseEvent({
     event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed',
@@ -84,7 +84,7 @@ test('success path calls deductReserved({taskId, orgId, uid, amount=taskData.cre
 test('failure path calls releaseReserved({taskId, orgId, amount=taskData.credits})', async () => {
   mockGet.mockResolvedValueOnce({
     exists: true,
-    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7 }),
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, api_job_id: 'job_1' }),
   });
   const res = await handler(baseEvent({
     event: 'job.failed', job_id: 'job_1', tool: 'upscale', status: 'failed',
@@ -112,7 +112,7 @@ test('already-terminal task settles nothing (idempotency — no double-settle on
 test('success path ingests outputs and merges results/s3_keys/thumbnail_keys into the status patch', async () => {
   mockGet.mockResolvedValueOnce({
     exists: true,
-    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, created_at: '07/10/2026, 10:00:00' }),
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, created_at: '07/10/2026, 10:00:00', api_job_id: 'job_1' }),
   });
   mockIngestOutputs.mockResolvedValueOnce({
     results: [{ s3_key: 'tasks/o1/upscale/2026/07/10/u1/t/1.png', url_type: 'cloudfront', cloudfront_url: 'https://cdn/x' }],
@@ -130,7 +130,7 @@ test('success path ingests outputs and merges results/s3_keys/thumbnail_keys int
 test('failure path does NOT call ingestOutputs', async () => {
   mockGet.mockResolvedValueOnce({
     exists: true,
-    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7 }),
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, api_job_id: 'job_1' }),
   });
   const res = await handler(baseEvent({
     event: 'job.failed', job_id: 'job_1', tool: 'upscale', status: 'failed',
@@ -138,4 +138,20 @@ test('failure path does NOT call ingestOutputs', async () => {
   }));
   expect(res.statusCode).toBe(200);
   expect(mockIngestOutputs).not.toHaveBeenCalled();
+});
+
+test('B3: empty api_job_id returns 500 to retry the writeback race', async () => {
+  mockGet.mockResolvedValueOnce({ exists: true, data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', credits: 7 }) });
+  const res = await handler(baseEvent({ event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed', outputs: [], request_id: 'task_1' }));
+  expect(res.statusCode).toBe(500);
+  expect(mockDeductReserved).not.toHaveBeenCalled();
+});
+
+test('B3: payload.job_id != taskData.api_job_id is dropped (200) and settles nothing', async () => {
+  mockGet.mockResolvedValueOnce({ exists: true, data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', credits: 7, api_job_id: 'job_real' }) });
+  const res = await handler(baseEvent({ event: 'job.completed', job_id: 'job_attacker', tool: 'upscale', status: 'completed', outputs: ['https://x/y.png'], request_id: 'task_1' }));
+  expect(res.statusCode).toBe(200);
+  expect(res.body).toContain('job_task_mismatch_ignored');
+  expect(mockDeductReserved).not.toHaveBeenCalled();
+  expect(mockUpdate).not.toHaveBeenCalled();
 });

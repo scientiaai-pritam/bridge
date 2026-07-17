@@ -64,7 +64,6 @@ Resources:
           FIREBASE_PRIVATE_KEY: !Ref FirebasePrivateKey
           FIREBASE_DATABASE_URL: !Ref FirebaseDatabaseUrl
           AWS_S3_BUCKET: !Ref WebS3Bucket
-          AWS_REGION: !Ref AWS::Region
           CLOUDFRONT_DOMAIN: !Ref CloudfrontDomain
           USE_CLOUDFRONT: !Ref UseCloudfront
       FunctionUrlConfig:

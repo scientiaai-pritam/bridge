@@ -33,6 +33,13 @@ export async function handler(event) {
   const taskData = snap.data() || {};
   if (TERMINAL.has(taskData.status)) return OK('{"ok":"already_terminal"}'); // idempotency
 
+  // B3: retry on empty api_job_id (writeback race); drop+log on job_id mismatch (replay/forge).
+  if (!taskData.api_job_id) return FAIL(500, '{"error":"api_job_id_pending"}');
+  if (payload.job_id !== taskData.api_job_id) {
+    console.warn(`[bridge] job/task mismatch ${payload.job_id} != ${taskData.api_job_id} for tasks/${taskId}`);
+    return OK('{"ok":"job_task_mismatch_ignored"}');
+  }
+
   const ok = payload.event === 'job.completed';
   const orgId = taskData.org_id;
   const userId = taskData.user_id;

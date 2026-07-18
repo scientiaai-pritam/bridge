@@ -1,6 +1,6 @@
 import { verifyWebhook } from './signing.js';
 import { firestore } from './firebase.js';
-import { writeTerminalStatus, TERMINAL, deductReserved, releaseReserved } from './settle.js';
+import { writeTerminalStatus, TERMINAL, deductReserved, releaseReserved, recordUsage, updateUserStats } from './settle.js';
 import { ingestOutputs } from './ingest.js';
 
 const SECRET = () => process.env.WEBHOOK_SIGNING_SECRET;
@@ -43,7 +43,11 @@ export async function handler(event) {
   const ok = payload.event === 'job.completed';
   const orgId = taskData.org_id;
   const userId = taskData.user_id;
-  const amount = Math.max(0, Math.trunc(Number(taskData.credits) || 0));
+  // settle_amount is the authoritative ledger amount (0 for unlimited orgs — nothing
+  // was reserved). credits is the catalog cost, used for tracking (credit_history, user_stats).
+  // Fall back to credits for tasks created before settle_amount was introduced.
+  const settleAmount = Math.max(0, Math.trunc(Number(taskData.settle_amount ?? taskData.credits) || 0));
+  const trackingAmount = Math.max(0, Math.trunc(Number(taskData.credits) || 0));
 
   // Phase 3: ingest outputs BEFORE writeTerminalStatus so a crash during ingest
   // leaves the task non-terminal (→ webhook retries). S3 PutObject is idempotent,
@@ -70,12 +74,28 @@ export async function handler(event) {
   // webhook from reaching here. Layer-2 idempotency: deductReserved/releaseReserved
   // each no-op when tasks/{taskId}.credits_settled === true, so the reconcile
   // safety net (Task 6) can re-run them without double-deduct.
-  if (orgId && amount > 0) {
+  if (orgId && (settleAmount > 0 || trackingAmount > 0)) {
     try {
       if (ok) {
-        await deductReserved({ taskId, orgId, uid: userId, amount });
+        if (settleAmount > 0) {
+          // Normal org: deduct from the reservation made at submit.
+          // credit_history is written inside the transaction.
+          await deductReserved({ taskId, orgId, uid: userId, amount: settleAmount });
+        } else if (trackingAmount > 0) {
+          // Unlimited org: nothing was reserved, but track usage (credit_history + credits_used).
+          await recordUsage({ taskId, orgId, uid: userId, amount: trackingAmount });
+        }
+        // user_stats counters for every successful non-zero-cost task (both lanes above).
+        if (trackingAmount > 0) {
+          const imageCount = ingest ? (ingest.results ? ingest.results.length : 0) : 0;
+          try {
+            await updateUserStats({ taskId, taskData, imageCount });
+          } catch (e) {
+            console.error('[bridge] user_stats update failed (non-fatal):', e);
+          }
+        }
       } else {
-        await releaseReserved({ taskId, orgId, amount });
+        await releaseReserved({ taskId, orgId, amount: settleAmount });
       }
     } catch (e) {
       // Status is already terminal in Firestore; a bridge retry would hit the

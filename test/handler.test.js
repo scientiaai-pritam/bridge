@@ -15,6 +15,8 @@ jest.unstable_mockModule('../src/firebase.js', () => ({
 
 const mockDeductReserved = jest.fn().mockResolvedValue(undefined);
 const mockReleaseReserved = jest.fn().mockResolvedValue(undefined);
+const mockRecordUsage = jest.fn().mockResolvedValue(undefined);
+const mockUpdateUserStats = jest.fn().mockResolvedValue(undefined);
 jest.unstable_mockModule('../src/settle.js', () => ({
   writeTerminalStatus: jest.fn(async ({ payload }) => ({
     status: payload.event === 'job.completed' ? 'completed' : 'failed',
@@ -22,6 +24,8 @@ jest.unstable_mockModule('../src/settle.js', () => ({
   TERMINAL: new Set(['completed', 'failed']),
   deductReserved: mockDeductReserved,
   releaseReserved: mockReleaseReserved,
+  recordUsage: mockRecordUsage,
+  updateUserStats: mockUpdateUserStats,
 }));
 
 const mockIngestOutputs = jest.fn();
@@ -67,7 +71,7 @@ test('returns 500 on missing task doc to force WebhookQueue retry', async () => 
   expect(res.statusCode).toBe(500);
 });
 
-test('success path calls deductReserved({taskId, orgId, uid, amount=taskData.credits}) after status write', async () => {
+test('success path calls deductReserved({taskId, orgId, uid, amount=taskData.credits}) + updateUserStats after status write', async () => {
   mockGet.mockResolvedValueOnce({
     exists: true,
     data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, api_job_id: 'job_1' }),
@@ -78,6 +82,12 @@ test('success path calls deductReserved({taskId, orgId, uid, amount=taskData.cre
   }));
   expect(res.statusCode).toBe(200);
   expect(mockDeductReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', uid: 'u1', amount: 7 });
+  expect(mockRecordUsage).not.toHaveBeenCalled();
+  expect(mockUpdateUserStats).toHaveBeenCalledWith({
+    taskId: 'task_1',
+    taskData: expect.objectContaining({ type: 'upscale', credits: 7 }),
+    imageCount: 0, // ingest not mocked → undefined → 0
+  });
   expect(mockReleaseReserved).not.toHaveBeenCalled();
 });
 
@@ -154,4 +164,82 @@ test('B3: payload.job_id != taskData.api_job_id is dropped (200) and settles not
   expect(res.body).toContain('job_task_mismatch_ignored');
   expect(mockDeductReserved).not.toHaveBeenCalled();
   expect(mockUpdate).not.toHaveBeenCalled();
+});
+
+test('settle_amount used when present, credits used for tracking (both lanes)', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, settle_amount: 5, api_job_id: 'job_1' }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed',
+    outputs: ['https://x/y.png'], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  // Ledger: settle_amount=5
+  expect(mockDeductReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', uid: 'u1', amount: 5 });
+  // Tracking: credits=7 (passed via taskData to updateUserStats)
+  expect(mockUpdateUserStats).toHaveBeenCalledWith({
+    taskId: 'task_1',
+    taskData: expect.objectContaining({ credits: 7, settle_amount: 5 }),
+    imageCount: 0, // ingest not mocked → undefined → 0
+  });
+});
+
+test('unlimited org: settle_amount=0, credits>0 → recordUsage + updateUserStats, no deductReserved', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 5, settle_amount: 0, api_job_id: 'job_1' }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed',
+    outputs: ['https://x/y.png'], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockDeductReserved).not.toHaveBeenCalled();
+  expect(mockRecordUsage).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', uid: 'u1', amount: 5 });
+  expect(mockUpdateUserStats).toHaveBeenCalled();
+});
+
+test('fallback: missing settle_amount uses credits for ledger amount', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, api_job_id: 'job_1' }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed',
+    outputs: [], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockDeductReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', uid: 'u1', amount: 7 });
+  expect(mockRecordUsage).not.toHaveBeenCalled();
+});
+
+test('updateUserStats failure does not fail the webhook response', async () => {
+  mockUpdateUserStats.mockRejectedValueOnce(new Error('stats write failed'));
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, api_job_id: 'job_1' }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed',
+    outputs: ['https://x/y.png'], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockDeductReserved).toHaveBeenCalled();
+});
+
+test('failure path does NOT call updateUserStats', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 7, api_job_id: 'job_1' }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.failed', job_id: 'job_1', tool: 'upscale', status: 'failed',
+    outputs: [], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockReleaseReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', amount: 7 });
+  expect(mockUpdateUserStats).not.toHaveBeenCalled();
+  expect(mockRecordUsage).not.toHaveBeenCalled();
 });

@@ -68,6 +68,28 @@ export function parseKolkataMs(s) {
 
 export const TERMINAL = new Set(['completed', 'failed']);
 
+// --- IST date helpers (mirror Python firebase_utils.py get_today_date / _to_yyyy_mm_dd) ---
+function getTodayDateIST() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: KOLKATA });
+}
+
+function toYYYYMMDD(value) {
+  let dt = null;
+  if (!value) {
+    dt = new Date();
+  } else if (typeof value === 'string') {
+    const parsed = new Date(value.replace('Z', '+00:00'));
+    if (!isNaN(parsed.getTime())) {
+      dt = parsed;
+    } else {
+      const m = value.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+      if (m) dt = new Date(`${m[3]}-${m[1]}-${m[2]}T00:00:00+05:30`);
+    }
+  }
+  if (!dt || isNaN(dt.getTime())) dt = new Date();
+  return dt.toLocaleDateString('en-CA', { timeZone: KOLKATA });
+}
+
 // --- Phase 2: transactional credit settle -------------------------------
 // JS reimplementation of firebase_utils.py:931-1121 but TRANSACTIONAL
 // (the Python version is non-transactional read-then-write — known issue;
@@ -138,10 +160,28 @@ export async function deductReserved({ taskId, orgId, uid, amount }) {
     if (reserved < amt) {
       throw new Error(`deductReserved: reserved_credits insufficient (reserved=${reserved}, required=${amt})`);
     }
+    // credit_history — mirror Python deduct_credits (firebase_utils.py:999-1021)
+    const today = getTodayDateIST();
+    const currentCredits = d.credits || 0;
+    const creditHistory = Array.isArray(d.credit_history) ? d.credit_history : [];
+    let todayEntry = creditHistory.find(e => e.date === today);
+    if (!todayEntry) {
+      todayEntry = {
+        date: today,
+        starting_credits: currentCredits,
+        used_credits: 0,
+        remaining_credits: currentCredits,
+      };
+      creditHistory.push(todayEntry);
+    }
+    todayEntry.used_credits += amt;
+    todayEntry.remaining_credits = currentCredits - amt;
+
     txn.update(orgRef, {
       credits: FieldValue.increment(-amt),
       reserved_credits: FieldValue.increment(-amt),
       credits_used: FieldValue.increment(amt),
+      credit_history: creditHistory,
     });
     if (userRef) {
       txn.update(userRef, { credits_used: FieldValue.increment(amt) });
@@ -159,6 +199,129 @@ export async function deductReserved({ taskId, orgId, uid, amount }) {
   if (touched) {
     await Promise.all([mirrorOrgCredits(orgId), mirrorCreditLimits(orgId, uid)]);
   }
+}
+
+/**
+ * Tracking-only entry for unlimited-plan orgs. Writes credit_history +
+ * credits_used but does NOT touch credits or reserved_credits (nothing was
+ * reserved for unlimited orgs). Called from handler when settle_amount=0
+ * but credits>0.
+ */
+export async function recordUsage({ taskId, orgId, uid, amount }) {
+  const amt = Math.max(0, Math.trunc(Number(amount) || 0));
+  if (amt === 0) return;
+  const orgRef = firestore().doc(`orgs/${orgId}`);
+  const taskRef = taskId ? firestore().doc(`tasks/${taskId}`) : null;
+  const userRef = uid ? firestore().doc(`org_users/${uid}`) : null;
+
+  let touched = false;
+  await firestore().runTransaction(async (txn) => {
+    if (taskRef) {
+      const tSnap = await txn.get(taskRef);
+      if (tSnap.exists && tSnap.data()?.credits_settled === true) {
+        return; // idempotent
+      }
+    }
+    const snap = await txn.get(orgRef);
+    if (!snap.exists) return;
+    const d = snap.data() || {};
+
+    const today = getTodayDateIST();
+    const currentCredits = d.credits || 0;
+    const creditHistory = Array.isArray(d.credit_history) ? d.credit_history : [];
+    let todayEntry = creditHistory.find(e => e.date === today);
+    if (!todayEntry) {
+      todayEntry = {
+        date: today,
+        starting_credits: currentCredits,
+        used_credits: 0,
+        remaining_credits: currentCredits,
+      };
+      creditHistory.push(todayEntry);
+    }
+    todayEntry.used_credits += amt;
+    todayEntry.remaining_credits = currentCredits; // balance unchanged for unlimited
+
+    const orgUpdate = {
+      credits_used: FieldValue.increment(amt),
+      credit_history: creditHistory,
+    };
+    txn.update(orgRef, orgUpdate);
+    if (userRef) {
+      txn.update(userRef, { credits_used: FieldValue.increment(amt) });
+    }
+    if (taskRef) {
+      txn.update(taskRef, {
+        credits_settled: true,
+        credits_settled_amount: amt,
+        settled_at: new Date().toISOString(),
+      });
+    }
+    touched = true;
+  });
+
+  if (touched) {
+    await Promise.all([mirrorOrgCredits(orgId), mirrorCreditLimits(orgId, uid)]);
+  }
+}
+
+/**
+ * Update user_stats/{userId} on task completion. Mirrors the Python
+ * update_user_stats_on_task_completion (firebase_utils.py:374-430)
+ * field-for-field. Idempotent via processed_tasks.{date} check.
+ */
+export async function updateUserStats({ taskId, taskData, imageCount = 1 }) {
+  const userId = taskData.user_id;
+  const orgId = taskData.org_id;
+  const taskType = (taskData.type || '').trim().toLowerCase();
+  if (!userId || !taskType || !taskId) return;
+
+  const opField = `${taskType}_op`;
+  const creditsField = `${taskType}_credits`;
+  const dateKey = toYYYYMMDD(taskData.created_at);
+  const imgCount = Math.max(0, Math.trunc(Number(imageCount) || 0)) || 1;
+
+  let creditsUsed = Math.max(0, Math.trunc(Number(taskData.credits) || 0));
+  const extraParams = taskData.extra_params || {};
+  if (extraParams.is_freeupscale || extraParams.is_free_upscale) {
+    creditsUsed = 0;
+  }
+
+  const statsRef = firestore().doc(`user_stats/${userId}`);
+
+  await firestore().runTransaction(async (txn) => {
+    const snap = await txn.get(statsRef);
+    const existing = snap.exists ? snap.data() : {};
+    const processedByDate = existing.processed_tasks || {};
+    const processedForDay = processedByDate[dateKey] || [];
+
+    if (processedForDay.includes(taskId)) {
+      return; // idempotent
+    }
+
+    txn.set(statsRef, { org_id: orgId }, { merge: true });
+
+    const updates = {
+      [`processed_tasks.${dateKey}`]: FieldValue.arrayUnion(taskId),
+      last_task_id: taskId,
+      last_task_time: taskData.created_at || new Date().toISOString(),
+      'operations.total': FieldValue.increment(1),
+      [`operations.date.${dateKey}.total`]: FieldValue.increment(1),
+      [`operations.date.${dateKey}.${opField}`]: FieldValue.increment(1),
+      'images_created.total': FieldValue.increment(imgCount),
+      [`images_created.date.${dateKey}.total`]: FieldValue.increment(imgCount),
+      [`images_created.date.${dateKey}.${taskType}`]: FieldValue.increment(imgCount),
+    };
+
+    if (creditsUsed > 0) {
+      updates['credits_used.total'] = FieldValue.increment(creditsUsed);
+      updates[`credits_used.${creditsField}`] = FieldValue.increment(creditsUsed);
+      updates[`credits_used.date.${dateKey}.total`] = FieldValue.increment(creditsUsed);
+      updates[`credits_used.date.${dateKey}.${creditsField}`] = FieldValue.increment(creditsUsed);
+    }
+
+    txn.update(statsRef, updates);
+  });
 }
 
 /**

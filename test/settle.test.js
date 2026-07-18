@@ -1,7 +1,10 @@
 import { jest } from '@jest/globals';
 
 jest.unstable_mockModule('firebase-admin/firestore', () => ({
-  FieldValue: { increment: (n) => ({ __inc: n }) },
+  FieldValue: {
+    increment: (n) => ({ __inc: n }),
+    arrayUnion: (v) => ({ __arrUnion: v }),
+  },
 }));
 
 const orgState = {};
@@ -43,7 +46,7 @@ jest.unstable_mockModule('../src/firebase.js', () => {
   };
 });
 
-const { deductReserved, releaseReserved, writeTerminalStatus } = await import('../src/settle.js');
+const { deductReserved, releaseReserved, writeTerminalStatus, recordUsage, updateUserStats } = await import('../src/settle.js');
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -61,6 +64,10 @@ describe('deductReserved', () => {
     expect(orgState.credits.__inc).toBe(-7);
     expect(orgState.reserved_credits.__inc).toBe(-7);
     expect(orgState.credits_used.__inc).toBe(7);
+    expect(Array.isArray(orgState.credit_history)).toBe(true);
+    expect(orgState.credit_history.length).toBe(1);
+    expect(orgState.credit_history[0].used_credits).toBe(7);
+    expect(orgState.credit_history[0].remaining_credits).toBe(93);
     expect(userState.credits_used.__inc).toBe(7);
     expect(taskState.credits_settled).toBe(true);
     expect(taskState.credits_settled_amount).toBe(7);
@@ -169,5 +176,34 @@ describe('writeTerminalStatus', () => {
     expect(mockRtdbSet).not.toHaveBeenCalled();
     expect(mockRtdbUpdate).not.toHaveBeenCalled();
     expect(mockTaskUpdate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('recordUsage', () => {
+  test('writes credit_history + credits_used but NOT credits/reserved_credits (unlimited org)', async () => {
+    mockOrgGet.mockReturnValue({ credits: 999, reserved_credits: 0, credits_used: 100 });
+    mockUserGet.mockReturnValue({ credits_used: 20 });
+    mockTaskGet.mockReturnValue({ status: 'processing', credits: 7, credits_settled: false });
+    await recordUsage({ taskId: 't1', orgId: 'o1', uid: 'u1', amount: 7 });
+    // credits and reserved_credits must NOT be touched
+    expect(orgState.credits).toBeUndefined();
+    expect(orgState.reserved_credits).toBeUndefined();
+    // credits_used and credit_history ARE written
+    expect(orgState.credits_used.__inc).toBe(7);
+    expect(Array.isArray(orgState.credit_history)).toBe(true);
+    expect(orgState.credit_history[0].used_credits).toBe(7);
+    expect(orgState.credit_history[0].remaining_credits).toBe(999); // unchanged
+    expect(userState.credits_used.__inc).toBe(7);
+    expect(taskState.credits_settled).toBe(true);
+  });
+
+  test('idempotent: no-op when credits_settled already true', async () => {
+    mockOrgGet.mockReturnValue({ credits: 999, reserved_credits: 0, credits_used: 100 });
+    mockUserGet.mockReturnValue({ credits_used: 20 });
+    mockTaskGet.mockReturnValue({ credits_settled: true });
+    await recordUsage({ taskId: 't1', orgId: 'o1', uid: 'u1', amount: 7 });
+    expect(Object.keys(orgState)).toHaveLength(0);
+    expect(Object.keys(userState)).toHaveLength(0);
+    expect(Object.keys(taskState)).toHaveLength(0);
   });
 });

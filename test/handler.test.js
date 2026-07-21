@@ -313,3 +313,44 @@ test('item_errors on a completed job are surfaced to writeTerminalStatus (partia
   // Still settles the full reserved amount (partial-success billing policy).
   expect(mockDeductReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', uid: 'u1', amount: 120, pool: 'cataloguing_credits' });
 });
+
+test('cataloguing pool failure: releaseReserved called with cataloguing_credits pool', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'cataloguing', credits: 120, settle_amount: 120, credit_pool: 'cataloguing_credits', api_job_id: 'job_1' }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.failed', job_id: 'job_1', tool: 'cataloguing', status: 'failed',
+    outputs: [], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockReleaseReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', amount: 120, pool: 'cataloguing_credits' });
+  expect(mockDeductReserved).not.toHaveBeenCalled();
+});
+
+test('credit_pool fallback: absent credit_pool reads extra_params.credit_type for pool selection', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'cataloguing', credits: 120, settle_amount: 120, extra_params: { credit_type: 'cataloguing_credits' }, api_job_id: 'job_1' }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.completed', job_id: 'job_1', tool: 'cataloguing', status: 'completed',
+    outputs: ['https://x/drape.png'], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  // Should settle against cataloguing_credits because extra_params.credit_type says so
+  expect(mockDeductReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', uid: 'u1', amount: 120, pool: 'cataloguing_credits' });
+});
+
+test('credit_pool fallback: absent credit_pool with extra_params.credit_type=credits settles AI pool', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'cataloguing', credits: 120, settle_amount: 120, extra_params: { credit_type: 'credits' }, api_job_id: 'job_1' }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.completed', job_id: 'job_1', tool: 'cataloguing', status: 'completed',
+    outputs: ['https://x/drape.png'], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockDeductReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', uid: 'u1', amount: 120, pool: 'credits' });
+});

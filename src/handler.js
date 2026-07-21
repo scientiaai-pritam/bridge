@@ -45,8 +45,13 @@ export async function handler(event) {
   const userId = taskData.user_id;
   // Which credit ledger to settle against. Pipeline tools (cataloguing,
   // product_photoshoot) may bill cataloguing_credits; everything else bills AI credits.
-  // Falls back to AI credits for tasks created before credit_pool was written.
-  const pool = taskData.credit_pool === 'cataloguing_credits' ? 'cataloguing_credits' : 'credits';
+  // Primary source: credit_pool (set by submit-api-tier for every task since the field was
+  // introduced). Fallback: extra_params.credit_type for tasks created during the transition
+  // window before credit_pool was written to the doc (mirrors the SQS worker's pool selection).
+  // Default: AI credits.
+  const pool = (taskData.credit_pool === 'cataloguing_credits'
+    || taskData.extra_params?.credit_type === 'cataloguing_credits')
+    ? 'cataloguing_credits' : 'credits';
   // settle_amount is the authoritative ledger amount (0 for unlimited orgs — nothing
   // was reserved). credits is the catalog cost, used for tracking (credit_history, user_stats).
   // Fall back to credits for tasks created before settle_amount was introduced.

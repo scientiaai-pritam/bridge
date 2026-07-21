@@ -207,3 +207,56 @@ describe('recordUsage', () => {
     expect(Object.keys(taskState)).toHaveLength(0);
   });
 });
+
+describe('cataloguing_credits pool', () => {
+  test('deductReserved: writes cataloguing_credits fields, skips org_users (no per-user cataloguing limit)', async () => {
+    mockOrgGet.mockReturnValue({ cataloguing_credits: 500, reserved_cataloguing_credits: 120, cataloguing_credits_used: 50 });
+    mockUserGet.mockReturnValue({ credits_used: 20 }); // AI credits_used — must NOT be touched
+    mockTaskGet.mockReturnValue({ status: 'processing', credits: 120, credits_settled: false });
+    await deductReserved({ taskId: 't1', orgId: 'o1', uid: 'u1', amount: 120, pool: 'cataloguing_credits' });
+    // cataloguing pool fields
+    expect(orgState.cataloguing_credits.__inc).toBe(-120);
+    expect(orgState.reserved_cataloguing_credits.__inc).toBe(-120);
+    expect(orgState.cataloguing_credits_used.__inc).toBe(120);
+    expect(Array.isArray(orgState.cataloguing_credit_history)).toBe(true);
+    expect(orgState.cataloguing_credit_history[0].used_credits).toBe(120);
+    expect(orgState.cataloguing_credit_history[0].remaining_credits).toBe(380);
+    // AI pool fields must NOT be touched
+    expect(orgState.credits).toBeUndefined();
+    expect(orgState.reserved_credits).toBeUndefined();
+    expect(orgState.credits_used).toBeUndefined();
+    // org_users.credits_used must NOT be touched (no per-user cataloguing ledger)
+    expect(Object.keys(userState)).toHaveLength(0);
+    // task settlement marker still written
+    expect(taskState.credits_settled).toBe(true);
+    expect(taskState.credits_settled_amount).toBe(120);
+  });
+
+  test('releaseReserved: releases from reserved_cataloguing_credits', async () => {
+    mockOrgGet.mockReturnValue({ reserved_cataloguing_credits: 100 });
+    mockTaskGet.mockReturnValue({ credits_settled: false });
+    await releaseReserved({ taskId: 't1', orgId: 'o1', amount: 50, pool: 'cataloguing_credits' });
+    expect(orgState.reserved_cataloguing_credits.__inc).toBe(-50);
+    // AI reserved must NOT be touched
+    expect(orgState.reserved_credits).toBeUndefined();
+    expect(taskState.credits_settled).toBe(true);
+  });
+
+  test('recordUsage: writes cataloguing_credit_history + cataloguing_credits_used but NOT cataloguing_credits or reserved_cataloguing_credits', async () => {
+    mockOrgGet.mockReturnValue({ cataloguing_credits: 500, reserved_cataloguing_credits: 0, cataloguing_credits_used: 100 });
+    mockUserGet.mockReturnValue({ credits_used: 20 });
+    mockTaskGet.mockReturnValue({ status: 'processing', credits: 78, credits_settled: false });
+    await recordUsage({ taskId: 't1', orgId: 'o1', uid: 'u1', amount: 78, pool: 'cataloguing_credits' });
+    // cataloguing_credits and reserved_cataloguing_credits must NOT be touched
+    expect(orgState.cataloguing_credits).toBeUndefined();
+    expect(orgState.reserved_cataloguing_credits).toBeUndefined();
+    // cataloguing_credits_used and cataloguing_credit_history ARE written
+    expect(orgState.cataloguing_credits_used.__inc).toBe(78);
+    expect(Array.isArray(orgState.cataloguing_credit_history)).toBe(true);
+    expect(orgState.cataloguing_credit_history[0].used_credits).toBe(78);
+    expect(orgState.cataloguing_credit_history[0].remaining_credits).toBe(500); // unchanged
+    // org_users.credits_used must NOT be touched
+    expect(Object.keys(userState)).toHaveLength(0);
+    expect(taskState.credits_settled).toBe(true);
+  });
+});

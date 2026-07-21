@@ -243,3 +243,37 @@ test('failure path does NOT call updateUserStats', async () => {
   expect(mockUpdateUserStats).not.toHaveBeenCalled();
   expect(mockRecordUsage).not.toHaveBeenCalled();
 });
+
+test('workflow step success: settle_amount > 0 → deductReserved + updateUserStats', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 5, settle_amount: 5, workflow_run_id: 'wf_run_1', workflow_step_id: 'step_1', api_job_id: 'job_1' }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.completed', job_id: 'job_1', tool: 'upscale', status: 'completed',
+    outputs: ['https://x/y.png'], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockDeductReserved).toHaveBeenCalledWith({ taskId: 'task_1', orgId: 'o1', uid: 'u1', amount: 5 });
+  expect(mockRecordUsage).not.toHaveBeenCalled();
+  expect(mockUpdateUserStats).toHaveBeenCalledWith({
+    taskId: 'task_1',
+    taskData: expect.objectContaining({ workflow_run_id: 'wf_run_1', workflow_step_id: 'step_1' }),
+    imageCount: 0,
+  });
+});
+
+test('workflow step failure: skips releaseReserved (workflow refund handles it)', async () => {
+  mockGet.mockResolvedValueOnce({
+    exists: true,
+    data: () => ({ status: 'processing', user_id: 'u1', org_id: 'o1', type: 'upscale', credits: 5, settle_amount: 5, workflow_run_id: 'wf_run_1', api_job_id: 'job_1' }),
+  });
+  const res = await handler(baseEvent({
+    event: 'job.failed', job_id: 'job_1', tool: 'upscale', status: 'failed',
+    outputs: [], request_id: 'task_1',
+  }));
+  expect(res.statusCode).toBe(200);
+  expect(mockReleaseReserved).not.toHaveBeenCalled();
+  expect(mockDeductReserved).not.toHaveBeenCalled();
+  expect(mockUpdateUserStats).not.toHaveBeenCalled();
+});

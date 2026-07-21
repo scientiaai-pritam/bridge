@@ -95,7 +95,10 @@ export async function handler(event) {
           }
         }
       } else {
-        await releaseReserved({ taskId, orgId, amount: settleAmount });
+        // Workflow steps skip releaseReserved — the workflow refund handles unused credits.
+        if (!taskData.workflow_run_id) {
+          await releaseReserved({ taskId, orgId, amount: settleAmount });
+        }
       }
     } catch (e) {
       // Status is already terminal in Firestore; a bridge retry would hit the

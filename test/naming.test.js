@@ -63,3 +63,45 @@ test('missing ref_image falls back to index base, then applies tool suffix', () 
   expect(buildOutputStem({ type: 'upscale', index: 0 })).toBe('1_rtp_4_35');
   expect(buildOutputStem({ type: 'color_matching', index: 1 })).toBe('2_color_matched_2');
 });
+
+// --- pipeline tools + multi-output uniqueness ---------------------------
+
+test('cataloguing builds kind-aware stems from meta.design_url', () => {
+  const meta = (kind, extra = {}) => ({ kind, design_url: 'https://s3/inputs/printA.png', ...extra });
+  expect(buildOutputStem({ type: 'cataloguing', index: 0, meta: meta('drape') })).toBe('printA_drape_1');
+  expect(buildOutputStem({ type: 'cataloguing', index: 3, meta: meta('video') })).toBe('printA_video_4');
+  expect(buildOutputStem({ type: 'cataloguing', index: 6, meta: meta('storyboard') })).toBe('printA_storyboard_7');
+  expect(buildOutputStem({ type: 'cataloguing', index: 7, meta: meta('bundle') })).toBe('printA_bundle');
+});
+
+test('cataloguing outputs never collide on the same S3 key stem', () => {
+  // Simulate a flat outputs list: 2 drapes + 1 video + 1 storyboard + 1 bundle.
+  const metas = [
+    { kind: 'drape', design_url: 'https://s3/inputs/a.png' },
+    { kind: 'drape', design_url: 'https://s3/inputs/a.png' },
+    { kind: 'video', design_url: 'https://s3/inputs/a.png' },
+    { kind: 'storyboard', design_url: 'https://s3/inputs/a.png' },
+    { kind: 'bundle', design_url: 'https://s3/inputs/a.png' },
+  ];
+  const stems = metas.map((m, i) => buildOutputStem({ type: 'cataloguing', index: i, meta: m }));
+  expect(new Set(stems).size).toBe(stems.length); // all unique
+});
+
+test('cataloguing without meta falls back to indexed cataloguing stem', () => {
+  expect(buildOutputStem({ type: 'cataloguing', index: 0 })).toBe('1_cataloguing_1');
+  expect(buildOutputStem({ type: 'cataloguing', index: 2 })).toBe('3_cataloguing_3');
+});
+
+test('product_photoshoot scene + bundle stems from meta.product_image_url', () => {
+  const product = 'https://s3/inputs/cushion.png';
+  expect(buildOutputStem({ type: 'product_photoshoot', index: 0, meta: { kind: 'scene', product_image_url: product } })).toBe('cushion_scene_1');
+  expect(buildOutputStem({ type: 'product_photoshoot', index: 4, meta: { kind: 'bundle', product_image_url: product } })).toBe('cushion_bundle');
+});
+
+test('multi-output single-shot tools suffix position so variations do not collide', () => {
+  // index 0 keeps the legacy name (back-compat); index>0 appends _N.
+  expect(buildOutputStem({ type: 'three_d_effect', refImage: REF, index: 0 })).toBe('desk_3d_effect');
+  expect(buildOutputStem({ type: 'three_d_effect', refImage: REF, index: 1 })).toBe('desk_3d_effect_2');
+  expect(buildOutputStem({ type: 'design_generation_v2', refImage: REF, index: 2 })).toBe('desk_design_creation_v2_3');
+  expect(buildOutputStem({ type: 'design_generation', refImage: REF, extraParams: { creativity: 50 }, index: 1 })).toBe('desk_design_creation_50_2');
+});

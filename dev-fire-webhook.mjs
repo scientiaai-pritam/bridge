@@ -40,13 +40,47 @@ const jobId    = arg('job-id', `job_fake_${Date.now()}`);
 const output   = arg('output', 'https://www.gstatic.com/webp/gallery/1.png'); // small public sample
 
 const ok = event === 'job.completed' || event === 'completed';
+
+// Pipeline tools fan out to many outputs. Build a realistic cataloguing payload
+// (2 drapes + 1 video + 1 storyboard + 1 bundle zip) with meta + one item_error,
+// so the local bridge exercises the multi-output ingest path (unique keys, meta
+// threading, synthesized draped_url/zip_url/video_url, null thumbs, item_errors).
+const SAMPLE_PNG = 'https://www.gstatic.com/webp/gallery/1.png';
+const SAMPLE_MP4 = 'https://www.gstatic.com/webp/gallery/1.png'; // placeholder; swap for a real mp4
+const SAMPLE_ZIP = 'https://www.gstatic.com/webp/gallery/1.png'; // placeholder; swap for a real zip
+
+function pipelineOutputs(t) {
+  if (t === 'cataloguing') {
+    return [
+      { type: 'png', url: SAMPLE_PNG, meta: { kind: 'drape', design_url: 'https://s3/print-a.png', model_url: 's3://model_0.png', color: 'original', design_index: 0, model_index: 0, color_index: 0 } },
+      { type: 'png', url: SAMPLE_PNG, meta: { kind: 'drape', design_url: 'https://s3/print-a.png', color: 'maroon', design_index: 0, model_index: 0, color_index: 1 } },
+      { type: 'mp4', url: SAMPLE_MP4, meta: { kind: 'video', video_index: 0, design_index: 0, model_index: 0, color: 'original' } },
+      { type: 'png', url: SAMPLE_PNG, meta: { kind: 'storyboard', storyboard_index: 0, storyboard_prompt: 'A model walks through a sunlit courtyard', design_index: 0, model_index: 0 } },
+      { type: 'zip', url: SAMPLE_ZIP, meta: { kind: 'bundle' } },
+    ];
+  }
+  if (t === 'product_photoshoot') {
+    return [
+      { type: 'png', url: SAMPLE_PNG, meta: { kind: 'scene', product_image_url: 'https://s3/cushion.png', scene_index: 0, background_description: 'sunlit living room sofa' } },
+      { type: 'png', url: SAMPLE_PNG, meta: { kind: 'scene', product_image_url: 'https://s3/cushion.png', scene_index: 1, background_description: 'minimal concrete plinth' } },
+      { type: 'zip', url: SAMPLE_ZIP, meta: { kind: 'bundle' } },
+    ];
+  }
+  return null;
+}
+
+const isPipeline = tool === 'cataloguing' || tool === 'product_photoshoot';
+const pipelineOut = isPipeline ? pipelineOutputs(tool) : null;
+
 const payload = {
   event: ok ? 'job.completed' : 'job.failed',
   job_id: jobId,
   tool,
   status: ok ? 'completed' : 'failed',
-  outputs: ok ? [output] : [],
+  outputs: ok ? (pipelineOut || [output]) : [],
   request_id: taskId,
+  // Partial success: one drape failed but the job still completed.
+  ...(ok && isPipeline ? { item_errors: [{ kind: 'drape', design_index: 1, model_index: 0, color: 'teal', error: 'provider returned no image' }] } : {}),
 };
 const body = JSON.stringify(payload);
 const ts = Math.floor(Date.now() / 1000);

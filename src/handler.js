@@ -43,6 +43,10 @@ export async function handler(event) {
   const ok = payload.event === 'job.completed';
   const orgId = taskData.org_id;
   const userId = taskData.user_id;
+  // Which credit ledger to settle against. Pipeline tools (cataloguing,
+  // product_photoshoot) may bill cataloguing_credits; everything else bills AI credits.
+  // Falls back to AI credits for tasks created before credit_pool was written.
+  const pool = taskData.credit_pool === 'cataloguing_credits' ? 'cataloguing_credits' : 'credits';
   // settle_amount is the authoritative ledger amount (0 for unlimited orgs — nothing
   // was reserved). credits is the catalog cost, used for tracking (credit_history, user_stats).
   // Fall back to credits for tasks created before settle_amount was introduced.
@@ -80,10 +84,10 @@ export async function handler(event) {
         if (settleAmount > 0) {
           // Normal org: deduct from the reservation made at submit.
           // credit_history is written inside the transaction.
-          await deductReserved({ taskId, orgId, uid: userId, amount: settleAmount });
+          await deductReserved({ taskId, orgId, uid: userId, amount: settleAmount, pool });
         } else if (trackingAmount > 0) {
           // Unlimited org: nothing was reserved, but track usage (credit_history + credits_used).
-          await recordUsage({ taskId, orgId, uid: userId, amount: trackingAmount });
+          await recordUsage({ taskId, orgId, uid: userId, amount: trackingAmount, pool });
         }
         // user_stats counters for every successful non-zero-cost task (both lanes above).
         if (trackingAmount > 0) {
@@ -97,7 +101,7 @@ export async function handler(event) {
       } else {
         // Workflow steps skip releaseReserved — the workflow refund handles unused credits.
         if (!taskData.workflow_run_id) {
-          await releaseReserved({ taskId, orgId, amount: settleAmount });
+          await releaseReserved({ taskId, orgId, amount: settleAmount, pool });
         }
       }
     } catch (e) {

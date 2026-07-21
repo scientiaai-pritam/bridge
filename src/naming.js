@@ -28,10 +28,20 @@ export function extractInputFilename(url) {
   return name.replace(/\.(jpe?g|png|tiff?|webp|gif|bmp|svg|psd)$/i, '');
 }
 
+// Pipeline tools (cataloguing, product_photoshoot) carry the source image inside
+// `meta` (design_url / product_image_url / reference_image_url) rather than a single
+// top-level ref_image. Derive a human-readable base name from whichever is present.
+function pipelineBaseName(meta, refImage) {
+  const ref = meta?.design_url || meta?.product_image_url || meta?.reference_image_url || refImage || '';
+  return extractInputFilename(ref);
+}
+
 // Build the output filename stem (no extension) for a single output of a task.
 // `index` is 0-based (matches the worker's `index`, displayed as `index + 1`).
 // `refImage` is taskData.ref_image; `extraParams` is taskData.extra_params.
-export function buildOutputStem({ type, index = 0, refImage = '', extraParams = {} }) {
+// `meta` is the API-tier output meta (pipeline tools): { kind, design_index,
+// model_index, color_index, video_index, storyboard_index, scene_index, ... }.
+export function buildOutputStem({ type, index = 0, refImage = '', extraParams = {}, meta = null }) {
   const p = extraParams || {};
   const filename = extractInputFilename(refImage) || String(index + 1);
 
@@ -56,7 +66,9 @@ export function buildOutputStem({ type, index = 0, refImage = '', extraParams = 
     case 'color_layering':
       return `${filename}_layered_${index + 1}`;
     case 'design_generation':
-      return `${filename}_design_creation_${creativity}`;
+      // generate_similar returns num_outputs (1-4); suffix the position so multiple
+      // outputs don't collide on the same S3 key. index 0 keeps the legacy name.
+      return `${filename}_design_creation_${creativity}${index > 0 ? `_${index + 1}` : ''}`;
     case 'repeat_set':
       return p.isExpanded
         ? `${filename}_repeat_set_Extend`
@@ -75,8 +87,23 @@ export function buildOutputStem({ type, index = 0, refImage = '', extraParams = 
       return `${filename}_deblurred`;
     case 'outfit_extractor':
       return `${filename}_dress_to_design`;
-    case 'cataloguing':
-      return `${filename}_cataloguing`;
+    case 'cataloguing': {
+      // Fans out to many files (drapes, mp4 videos, storyboard grids, one zip bundle).
+      // The sequential `index` guarantees key uniqueness; meta.kind makes the filename
+      // readable and lets ingest synthesize the legacy UI field names.
+      const base = pipelineBaseName(meta, refImage) || String(index + 1);
+      const kind = meta?.kind;
+      if (kind === 'bundle') return `${base}_bundle`;
+      if (kind === 'fix_image') return `${base}_fix`;
+      return kind ? `${base}_${kind}_${index + 1}` : `${base}_cataloguing_${index + 1}`;
+    }
+    case 'product_photoshoot': {
+      // Places one product into N backgrounds/scenes -> one image per scene + a zip bundle.
+      const base = pipelineBaseName(meta, refImage) || String(index + 1);
+      const kind = meta?.kind;
+      if (kind === 'bundle') return `${base}_bundle`;
+      return kind ? `${base}_${kind}_${index + 1}` : `${base}_scene_${index + 1}`;
+    }
     case 'design_creation':
       if (p.isImageBlendMode) return `${filename}_design_generation_Blend`;
       if (p.inpaint_mode) return `${filename}_design_generation_Inpaint`;
@@ -90,9 +117,11 @@ export function buildOutputStem({ type, index = 0, refImage = '', extraParams = 
     case 'vectorizer':
       return `${filename}_vectorizer`;
     case 'three_d_effect':
-      return `${filename}_3d_effect`;
+      // count may be 1-4; suffix the position so variations don't collide.
+      return `${filename}_3d_effect${index > 0 ? `_${index + 1}` : ''}`;
     case 'design_generation_v2':
-      return `${filename}_design_creation_v2`;
+      // num_outputs may be 1-5; suffix the position so variations don't collide.
+      return `${filename}_design_creation_v2${index > 0 ? `_${index + 1}` : ''}`;
     case 'design_generation_basic':
       return `${filename}_design_generation_basic`;
     case 'image_enhance':

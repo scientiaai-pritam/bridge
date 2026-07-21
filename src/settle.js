@@ -1,5 +1,6 @@
 import { firestore, rtdb } from './firebase.js';
 import { FieldValue } from 'firebase-admin/firestore';
+import { poolFields } from './pool-fields.js';
 
 const KOLKATA = 'Asia/Kolkata';
 const nowStr = () => new Date().toLocaleString('en-US', { timeZone: KOLKATA });
@@ -25,6 +26,12 @@ export async function writeTerminalStatus({ taskId, payload, taskData, ingest = 
       ? {
           completed_at: completedAt,
           ...(ingest ? { results: ingest.results, s3_keys: ingest.s3_keys, thumbnail_keys: ingest.thumbnail_keys } : {}),
+          // Pipeline tools (cataloguing, product_photoshoot) report per-output failures
+          // even on a "completed" job. Surface them so the UI can list which drapes/scenes
+          // failed; the job is still billed in full (partial-success policy).
+          ...(Array.isArray(payload.item_errors) && payload.item_errors.length
+            ? { item_errors: payload.item_errors }
+            : {}),
         }
       : {
           failed_at: completedAt,
@@ -102,10 +109,19 @@ async function mirrorOrgCredits(orgId) {
     const snap = await firestore().doc(`orgs/${orgId}`).get();
     if (!snap.exists) return;
     const d = snap.data() || {};
+    const ai = poolFields('credits');
+    const cat = poolFields('cataloguing_credits');
+    const aiBal = d[ai.balance] || 0;
+    const aiRes = d[ai.reserved] || 0;
+    const catBal = d[cat.balance] || 0;
+    const catRes = d[cat.reserved] || 0;
     await rtdb().ref(`orgCredits/${orgId}`).update({
-      credits: d.credits || 0,
-      reserved_credits: d.reserved_credits || 0,
-      available_credits: (d.credits || 0) - (d.reserved_credits || 0),
+      [ai.balance]: aiBal,
+      [ai.reserved]: aiRes,
+      available_credits: aiBal - aiRes,
+      [cat.balance]: catBal,
+      [cat.reserved]: catRes,
+      available_cataloguing_credits: catBal - catRes,
     });
   } catch (e) {
     console.error('[bridge] RTDB orgCredits mirror failed (non-fatal):', e);
@@ -131,17 +147,21 @@ async function mirrorCreditLimits(orgId, uid) {
 }
 
 /**
- * Transactionally deduct a previously-reserved amount on success.
- * Field math on orgs/{orgId}: credits -= amt, reserved_credits -= amt, credits_used += amt.
- * Also org_users/{uid}.credits_used += amt (per-user limit accounting — I2).
+ * Transactionally deduct a previously-reserved amount on success, from the given pool.
+ * Field math on orgs/{orgId}: <balance> -= amt, <reserved> -= amt, <used> += amt.
+ * AI pool also bumps org_users/{uid}.credits_used (per-user limit accounting — I2);
+ * cataloguing pool has no per-user ledger today, so the user update is skipped.
  * Marks tasks/{taskId}.credits_settled = true (idempotency marker).
+ *
+ * @param {string} [pool='credits']  'credits' | 'cataloguing_credits'
  */
-export async function deductReserved({ taskId, orgId, uid, amount }) {
+export async function deductReserved({ taskId, orgId, uid, amount, pool = 'credits' }) {
   const amt = Math.max(0, Math.trunc(Number(amount) || 0));
   if (amt === 0) return;
+  const f = poolFields(pool);
   const orgRef = firestore().doc(`orgs/${orgId}`);
   const taskRef = taskId ? firestore().doc(`tasks/${taskId}`) : null;
-  const userRef = uid ? firestore().doc(`org_users/${uid}`) : null;
+  const userRef = uid && f.perUserUsed ? firestore().doc(`org_users/${uid}`) : null;
 
   let touched = false;
   await firestore().runTransaction(async (txn) => {
@@ -156,14 +176,14 @@ export async function deductReserved({ taskId, orgId, uid, amount }) {
       throw new Error(`deductReserved: org ${orgId} not found`);
     }
     const d = snap.data() || {};
-    const reserved = d.reserved_credits || 0;
+    const reserved = d[f.reserved] || 0;
     if (reserved < amt) {
-      throw new Error(`deductReserved: reserved_credits insufficient (reserved=${reserved}, required=${amt})`);
+      throw new Error(`deductReserved: ${f.reserved} insufficient (reserved=${reserved}, required=${amt})`);
     }
     // credit_history — mirror Python deduct_credits (firebase_utils.py:999-1021)
     const today = getTodayDateIST();
-    const currentCredits = d.credits || 0;
-    const creditHistory = Array.isArray(d.credit_history) ? d.credit_history : [];
+    const currentCredits = d[f.balance] || 0;
+    const creditHistory = Array.isArray(d[f.history]) ? d[f.history] : [];
     let todayEntry = creditHistory.find(e => e.date === today);
     if (!todayEntry) {
       todayEntry = {
@@ -178,13 +198,13 @@ export async function deductReserved({ taskId, orgId, uid, amount }) {
     todayEntry.remaining_credits = currentCredits - amt;
 
     txn.update(orgRef, {
-      credits: FieldValue.increment(-amt),
-      reserved_credits: FieldValue.increment(-amt),
-      credits_used: FieldValue.increment(amt),
-      credit_history: creditHistory,
+      [f.balance]: FieldValue.increment(-amt),
+      [f.reserved]: FieldValue.increment(-amt),
+      [f.used]: FieldValue.increment(amt),
+      [f.history]: creditHistory,
     });
     if (userRef) {
-      txn.update(userRef, { credits_used: FieldValue.increment(amt) });
+      txn.update(userRef, { [f.perUserUsed]: FieldValue.increment(amt) });
     }
     if (taskRef) {
       txn.update(taskRef, {
@@ -202,17 +222,20 @@ export async function deductReserved({ taskId, orgId, uid, amount }) {
 }
 
 /**
- * Tracking-only entry for unlimited-plan orgs. Writes credit_history +
- * credits_used but does NOT touch credits or reserved_credits (nothing was
+ * Tracking-only entry for unlimited-plan orgs. Writes <history> +
+ * <used> but does NOT touch <balance> or <reserved> (nothing was
  * reserved for unlimited orgs). Called from handler when settle_amount=0
  * but credits>0.
+ *
+ * @param {string} [pool='credits']  'credits' | 'cataloguing_credits'
  */
-export async function recordUsage({ taskId, orgId, uid, amount }) {
+export async function recordUsage({ taskId, orgId, uid, amount, pool = 'credits' }) {
   const amt = Math.max(0, Math.trunc(Number(amount) || 0));
   if (amt === 0) return;
+  const f = poolFields(pool);
   const orgRef = firestore().doc(`orgs/${orgId}`);
   const taskRef = taskId ? firestore().doc(`tasks/${taskId}`) : null;
-  const userRef = uid ? firestore().doc(`org_users/${uid}`) : null;
+  const userRef = uid && f.perUserUsed ? firestore().doc(`org_users/${uid}`) : null;
 
   let touched = false;
   await firestore().runTransaction(async (txn) => {
@@ -227,8 +250,8 @@ export async function recordUsage({ taskId, orgId, uid, amount }) {
     const d = snap.data() || {};
 
     const today = getTodayDateIST();
-    const currentCredits = d.credits || 0;
-    const creditHistory = Array.isArray(d.credit_history) ? d.credit_history : [];
+    const currentCredits = d[f.balance] || 0;
+    const creditHistory = Array.isArray(d[f.history]) ? d[f.history] : [];
     let todayEntry = creditHistory.find(e => e.date === today);
     if (!todayEntry) {
       todayEntry = {
@@ -243,12 +266,12 @@ export async function recordUsage({ taskId, orgId, uid, amount }) {
     todayEntry.remaining_credits = currentCredits; // balance unchanged for unlimited
 
     const orgUpdate = {
-      credits_used: FieldValue.increment(amt),
-      credit_history: creditHistory,
+      [f.used]: FieldValue.increment(amt),
+      [f.history]: creditHistory,
     };
     txn.update(orgRef, orgUpdate);
     if (userRef) {
-      txn.update(userRef, { credits_used: FieldValue.increment(amt) });
+      txn.update(userRef, { [f.perUserUsed]: FieldValue.increment(amt) });
     }
     if (taskRef) {
       txn.update(taskRef, {
@@ -325,12 +348,15 @@ export async function updateUserStats({ taskId, taskData, imageCount = 1 }) {
 }
 
 /**
- * Transactionally release a reservation on failure.
- * orgs/{orgId}.reserved_credits -= amt (clamped at 0). Marks tasks/{taskId}.credits_settled = true.
+ * Transactionally release a reservation on failure, in the given pool.
+ * orgs/{orgId}.<reserved> -= amt (clamped at 0). Marks tasks/{taskId}.credits_settled = true.
+ *
+ * @param {string} [pool='credits']  'credits' | 'cataloguing_credits'
  */
-export async function releaseReserved({ taskId, orgId, amount }) {
+export async function releaseReserved({ taskId, orgId, amount, pool = 'credits' }) {
   const requested = Math.max(0, Math.trunc(Number(amount) || 0));
   if (requested === 0) return;
+  const f = poolFields(pool);
   const orgRef = firestore().doc(`orgs/${orgId}`);
   const taskRef = taskId ? firestore().doc(`tasks/${taskId}`) : null;
 
@@ -344,10 +370,10 @@ export async function releaseReserved({ taskId, orgId, amount }) {
     }
     const snap = await txn.get(orgRef);
     if (!snap.exists) return;
-    const reserved = snap.data()?.reserved_credits || 0;
+    const reserved = snap.data()?.[f.reserved] || 0;
     const toRelease = Math.min(requested, reserved); // clamp
     if (toRelease > 0) {
-      txn.update(orgRef, { reserved_credits: FieldValue.increment(-toRelease) });
+      txn.update(orgRef, { [f.reserved]: FieldValue.increment(-toRelease) });
     }
     if (taskRef) {
       txn.update(taskRef, {

@@ -32,6 +32,13 @@ export async function writeTerminalStatus({ taskId, payload, taskData, ingest = 
           ...(Array.isArray(payload.item_errors) && payload.item_errors.length
             ? { item_errors: payload.item_errors }
             : {}),
+          // all_modes outfit_extractor: fan-out across 3 models; some may fail while
+          // others succeed. Forward partial-failure tracking so the UI can surface
+          // which modes failed. Credit settlement is still in full (same policy as
+          // item_errors).
+          ...(payload.has_partial_failures
+            ? { has_partial_failures: true, failed_modes: payload.failed_modes || [] }
+            : {}),
         }
       : {
           failed_at: completedAt,

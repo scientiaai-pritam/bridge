@@ -167,6 +167,40 @@ describe('writeTerminalStatus', () => {
     expect(patch).not.toHaveProperty('queue_duration_ms');
   });
 
+  test('all_modes partial success: forwards has_partial_failures + failed_modes to Firestore', async () => {
+    await writeTerminalStatus({
+      taskId: 'task_am',
+      payload: {
+        event: 'job.completed', job_id: 'job_am',
+        has_partial_failures: true,
+        failed_modes: ['inspired_pattern'],
+      },
+      taskData: { user_id: 'u1' },
+    });
+    expect(mockTaskUpdate).toHaveBeenCalledTimes(1);
+    const patch = mockTaskUpdate.mock.calls[0][0];
+    expect(patch.status).toBe('completed');
+    expect(patch.has_partial_failures).toBe(true);
+    expect(patch.failed_modes).toEqual(['inspired_pattern']);
+  });
+
+  test('all_modes full success: does NOT set has_partial_failures when false', async () => {
+    await writeTerminalStatus({
+      taskId: 'task_am2',
+      payload: {
+        event: 'job.completed', job_id: 'job_am2',
+        has_partial_failures: false,
+        failed_modes: [],
+      },
+      taskData: { user_id: 'u1' },
+    });
+    expect(mockTaskUpdate).toHaveBeenCalledTimes(1);
+    const patch = mockTaskUpdate.mock.calls[0][0];
+    expect(patch.status).toBe('completed');
+    expect(patch).not.toHaveProperty('has_partial_failures');
+    expect(patch).not.toHaveProperty('failed_modes');
+  });
+
   test('does NOT mirror to RTDB tasks/{userId} (Firestore is the sole terminal write)', async () => {
     await writeTerminalStatus({
       taskId: 'task_4',
